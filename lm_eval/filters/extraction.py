@@ -125,6 +125,10 @@ class MultiChoiceRegexFilter(RegexFilter):
 
     Assumes each document has a "choices" field containing the list of answer choices
     and that the answer label symbols are of the form (A), (B), (C), ... or A, B, C.
+
+    If normalized choices collide, use punctuation at the selected match to distinguish
+    them. Case and regex ignores still apply. If the choice is still ambiguous, try
+    the letter fallback before returning the configured fallback value.
     """
 
     def __init__(
@@ -191,10 +195,50 @@ class MultiChoiceRegexFilter(RegexFilter):
             if self.ignore_case:
                 st = st.lower()
 
-            if self.ignore_punctuation:
-                # https://stackoverflow.com/a/266162
-                st = st.translate(punct_tbl)
             return st
+
+        def normalize_punctuation(st):
+            return st.translate(punct_tbl) if self.ignore_punctuation else st
+
+        def find_choice_match(regex, resp, choice_to_alpha):
+            literal_resp = filter_ignores(resp)
+            normalized_resp = normalize_punctuation(literal_resp)
+            matches = list(regex.finditer(normalized_resp))
+            if not matches:
+                return ""
+            selected = matches[self.group_select]
+            match = selected.group().strip()
+            if not match:
+                return ""
+            candidates = choice_to_alpha.get(match)
+            if not candidates:
+                return match
+            if len(candidates) == 1:
+                return candidates[0][1]
+            if not self.ignore_punctuation:
+                return ""
+
+            # Recover only this match's original location, including punctuation
+            # adjoining its edges (e.g. the minus sign before a matched "5").
+            positions = [
+                i for i, char in enumerate(literal_resp) if ord(char) not in punct_tbl
+            ]
+            start = positions[selected.start() - 1] + 1 if selected.start() else 0
+            end = (
+                positions[selected.end()]
+                if selected.end() < len(positions)
+                else len(literal_resp)
+            )
+            fragment = literal_resp[start:end]
+            exact = [
+                (len(choice), target)
+                for choice, target in candidates
+                if choice in fragment
+            ]
+            # Preserve longest-choice matching: "5" is also a substring of "-5".
+            longest = max((length for length, _ in exact), default=0)
+            targets = [target for length, target in exact if length == longest]
+            return targets[0] if len(targets) == 1 else ""
 
         filtered_resps = []
 
@@ -208,9 +252,10 @@ class MultiChoiceRegexFilter(RegexFilter):
 
             choices = doc["choices"]
             for c in choices:
-                m = filter_ignores(c.strip())
+                literal = filter_ignores(c.strip())
+                m = normalize_punctuation(literal)
                 fallback_regexes.append(f"{re.escape(m)}")
-                choice_to_alpha[m] = f"({next_alpha})"
+                choice_to_alpha.setdefault(m, []).append((literal, f"({next_alpha})"))
 
                 without_paren_fallback_regexes.append(next_alpha)
                 without_paren_to_target[next_alpha] = f"({next_alpha})"
@@ -232,9 +277,7 @@ class MultiChoiceRegexFilter(RegexFilter):
             for resp in r:
                 match = find_match(self.regex, resp)
                 if not match:
-                    match = find_match(
-                        fallback_regex, filter_ignores(resp), choice_to_alpha
-                    )
+                    match = find_choice_match(fallback_regex, resp, choice_to_alpha)
                     if not match:
                         match = find_match(
                             without_paren_fallback_regex, resp, without_paren_to_target

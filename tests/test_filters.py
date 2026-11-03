@@ -72,6 +72,180 @@ def test_multi_choice_regex_prefix_fix_holds_under_task_config():
     assert filt.apply([["the answer is Guilty"]], docs) == [["(A)"]]
 
 
+@pytest.mark.parametrize("choices", [["-5", "5"], ["15", "1.5"]])
+@pytest.mark.parametrize("reverse_choices", [False, True])
+def test_multi_choice_regex_preserves_colliding_choice_punctuation(
+    choices, reverse_choices
+):
+    if reverse_choices:
+        choices = list(reversed(choices))
+    filt = MultiChoiceRegexFilter(
+        regex_pattern=r"(\([A-Z]\))",
+        group_select=-1,
+        ignore_case=True,
+        ignore_punctuation=True,
+    )
+    resps = [[f"The answer is {choice}" for choice in choices]]
+
+    assert filt.apply(resps, [{"choices": choices}]) == [["(A)", "(B)"]]
+
+
+@pytest.mark.parametrize("choices", [["-5", "5"], ["5", "-5"]])
+@pytest.mark.parametrize(
+    "group_select,selected_choice", [(0, "-5"), (1, "5"), (-1, "5")]
+)
+def test_multi_choice_regex_resolves_only_the_selected_match(
+    choices, group_select, selected_choice
+):
+    filt = MultiChoiceRegexFilter(
+        regex_pattern=r"(\([A-Z]\))",
+        group_select=group_select,
+        ignore_punctuation=True,
+    )
+    target = f"({chr(ord('A') + choices.index(selected_choice))})"
+
+    assert filt.apply([["Not -5; the answer is 5."]], [{"choices": choices}]) == [
+        [target]
+    ]
+
+
+def test_multi_choice_regex_preserves_primary_regex_priority_with_collisions():
+    filt = MultiChoiceRegexFilter(
+        regex_pattern=r"(\([A-Z]\))",
+        group_select=-1,
+        ignore_punctuation=True,
+    )
+
+    assert filt.apply(
+        [["The answer is (B), not -5.", "(A) or (B): -5"]],
+        [{"choices": ["-5", "5"]}],
+    ) == [["(B)", "(B)"]]
+
+
+def test_multi_choice_regex_retains_configured_ignores_when_resolving_collisions():
+    filt = MultiChoiceRegexFilter(
+        regex_pattern=r"(\([A-Z]\))",
+        group_select=-1,
+        ignore_punctuation=True,
+        regexes_to_ignore=[r" USD"],
+    )
+
+    assert filt.apply(
+        [["The answer is -5 USD", "Not -5 USD; the answer is 5 USD."]],
+        [{"choices": ["-5 USD", "5 USD"]}],
+    ) == [["(A)", "(B)"]]
+
+
+def test_multi_choice_regex_preserves_shape_and_unambiguous_normalization():
+    filt = MultiChoiceRegexFilter(
+        regex_pattern=r"(\([A-Z]\))",
+        group_select=-1,
+        ignore_case=True,
+        ignore_punctuation=True,
+        fallback="unmatched",
+    )
+
+    assert filt.apply(
+        [["ALPHA!", "beta", "unknown"], ["-5", "5", "unknown"]],
+        [{"choices": ["alpha", "beta"]}, {"choices": ["-5", "5"]}],
+    ) == [["(A)", "(B)", "unmatched"], ["(A)", "(B)", "unmatched"]]
+
+
+@pytest.mark.parametrize(
+    "choices,response,options",
+    [
+        (["Na", "NA"], "Na", {"ignore_case": True}),
+        (["NA", "Na"], "Na", {"ignore_case": True}),
+        (
+            ["-5", "5"],
+            "-5",
+            {"ignore_punctuation": True, "regexes_to_ignore": [r"-"]},
+        ),
+        (
+            ["5", "-5"],
+            "-5",
+            {"ignore_punctuation": True, "regexes_to_ignore": [r"-"]},
+        ),
+        (["-5", "-5", "5"], "-5", {"ignore_punctuation": True}),
+        (["alpha", "alpha"], "alpha", {}),
+        (["-5", "5."], "5", {"ignore_punctuation": True}),
+        (["-5", "5-"], "-5-", {"ignore_punctuation": True}),
+    ],
+)
+def test_multi_choice_regex_ambiguous_choices_use_existing_fallbacks(
+    choices, response, options
+):
+    filt = MultiChoiceRegexFilter(
+        regex_pattern=r"(\([A-Z]\))",
+        group_select=-1,
+        fallback="ambiguous",
+        **options,
+    )
+
+    assert filt.apply(
+        [[response, response + ": A", response + " (B)"]], [{"choices": choices}]
+    ) == [["ambiguous", "(A)", "(B)"]]
+
+
+def test_multi_choice_regex_duplicate_choices_do_not_hide_a_distinct_choice():
+    filt = MultiChoiceRegexFilter(regex_pattern=r"(\([A-Z]\))", ignore_punctuation=True)
+
+    assert filt.apply([["5"]], [{"choices": ["-5", "-5", "5"]}]) == [["(C)"]]
+
+
+@pytest.mark.parametrize(
+    "choices,options",
+    [
+        (["!!!", "beta"], {"ignore_punctuation": True}),
+        (["alpha", "beta"], {"regexes_to_ignore": [r"alpha"]}),
+        (["!", "?"], {"ignore_punctuation": True}),
+        (["", "beta"], {}),
+    ],
+)
+def test_multi_choice_regex_empty_normalized_choice_keeps_existing_fallback(
+    choices, options
+):
+    filt = MultiChoiceRegexFilter(
+        regex_pattern=r"(\([A-Z]\))",
+        group_select=-1,
+        fallback="unmatched",
+        **options,
+    )
+
+    assert filt.apply([["unknown", ": B"]], [{"choices": choices}]) == [
+        ["unmatched", "(B)"]
+    ]
+
+
+@pytest.mark.parametrize("group_select,target", [(0, "(A)"), (-1, "(B)")])
+def test_multi_choice_regex_keeps_normalized_match_selection_with_collisions(
+    group_select, target
+):
+    filt = MultiChoiceRegexFilter(
+        regex_pattern=r"(\([A-Z]\))",
+        group_select=group_select,
+        ignore_punctuation=True,
+    )
+
+    assert filt.apply(
+        [["foobar; the answer is -5"]], [{"choices": ["foo-bar", "-5", "5"]}]
+    ) == [[target]]
+
+
+@pytest.mark.parametrize("choices", [["-5", "5"], ["15", "1.5"]])
+def test_multi_choice_regex_resolves_collisions_inside_surrounding_punctuation(choices):
+    filt = MultiChoiceRegexFilter(
+        regex_pattern=r"(\([A-Z]\))",
+        group_select=-1,
+        ignore_punctuation=True,
+    )
+
+    assert filt.apply(
+        [[f"The answer is ({choices[0]}).", f"The answer is [{choices[1]}]."]],
+        [{"choices": choices}],
+    ) == [["(A)", "(B)"]]
+
+
 @pytest.mark.parametrize("variant", ["zeroshot", "cot_zeroshot"])
 def test_bbh_multi_choice_regex_prefix_choice_does_not_shadow_longer_choice(variant):
     # bbh keeps its own copy of MultiChoiceRegexFilter, wired via
